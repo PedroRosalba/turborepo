@@ -1,11 +1,12 @@
-//! Native setup entry point. Discovery and provisioning land separately.
+//! Native frozen tools-only setup. No task/dependency execution or activation.
 
 use miette::Diagnostic;
 use thiserror::Error;
-use turbopath::AbsoluteSystemPathBuf;
+use turborepo_setup::source_policy::OfficialSourcePolicy;
 
 use crate::cli::{Args, SetupArgs};
 
+mod provision;
 mod root;
 
 #[derive(Debug, Error, Diagnostic)]
@@ -22,7 +23,9 @@ pub enum Error {
     #[error("--update-lock cannot be used in frozen mode (inferred in CI)")]
     #[diagnostic(help("For an intentional lock refresh in CI, pass --no-frozen --update-lock."))]
     FrozenUpdateLock,
-    #[error("`turbo setup` provisioning is not implemented yet in this version")]
+    #[error(
+        "this setup mode is not implemented; only --frozen --tools-only provisioning is supported"
+    )]
     #[diagnostic(
         code(turbo::setup::not_implemented),
         help(
@@ -33,6 +36,22 @@ pub enum Error {
         )
     )]
     NotImplemented,
+    #[error("unsupported setup request: {0}")]
+    Unsupported(&'static str),
+    #[error(transparent)]
+    SourcePolicy(#[from] turborepo_setup::source_policy::Error),
+    #[error(transparent)]
+    Storage(#[from] turborepo_setup::lock::StorageError),
+    #[error(transparent)]
+    Lock(#[from] turborepo_setup::lock::Error),
+    #[error(transparent)]
+    Node(#[from] turborepo_setup::node_provision::Error),
+    #[error(transparent)]
+    Pnpm(#[from] turborepo_setup::pnpm_provision::Error),
+    #[error(transparent)]
+    Install(#[from] turborepo_tool_install::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     #[error(transparent)]
     #[diagnostic(transparent)]
     Root(#[from] root::Error),
@@ -97,34 +116,68 @@ impl SetupRequest {
 }
 
 pub fn run(args: &Args, setup_args: &SetupArgs) -> Result<i32, Error> {
+    let invocation = match args.cwd.as_deref() {
+        Some(cwd) => turbopath::AbsoluteSystemPathBuf::from_cwd(cwd)?,
+        None => turbopath::AbsoluteSystemPathBuf::cwd()?,
+    };
+    run_with_policy(args, setup_args, None, || {
+        Ok(OfficialSourcePolicy::inspect(
+            invocation.as_std_path(),
+            None,
+        )?)
+    })
+}
+
+// Trusted internal fixture injection only: never a CLI flag, repo URL or env
+// override.
+fn run_with_policy(
+    args: &Args,
+    setup_args: &SetupArgs,
+    transports: Option<provision::Transports>,
+    preflight: impl Fn() -> Result<OfficialSourcePolicy, Error>,
+) -> Result<i32, Error> {
     // Discovery reads files only: no environment config pipeline, graph, tool
     // probes, package manager detection, or local CLI handoff.
-    let cwd = match args.cwd.as_deref() {
-        Some(cwd) => AbsoluteSystemPathBuf::from_cwd(cwd)?,
-        None => AbsoluteSystemPathBuf::cwd()?,
-    };
-    let config = args
-        .root_turbo_json
-        .as_deref()
-        .map(AbsoluteSystemPathBuf::from_cwd)
-        .transpose()?;
-    let root = root::infer(&cwd, args.cwd.is_some(), config.as_deref())?;
-    tracing::debug!("setup root: {}", root.path);
-    if !root.flags.experimental_setup {
+    let discovery = root::Discovery::capture(args)?;
+    tracing::debug!("setup root: {}", discovery.root_path());
+    if !discovery.flags().experimental_setup {
         return Err(Error::Disabled);
     }
 
-    execute(SetupRequest::new(setup_args, turborepo_ci::is_ci())?)
+    let request = SetupRequest::new(setup_args, turborepo_ci::is_ci())?;
+    validate_request(&request)?;
+    if args.test_run {
+        return Err(Error::NotImplemented);
+    }
+    let eligible = discovery.source_eligibility();
+    if eligible.cargo() || eligible.python() || eligible.go() {
+        return Err(Error::Unsupported("non-JavaScript workspace setup"));
+    }
+    let snapshot =
+        turborepo_setup::lock::Snapshot::capture(discovery.snapshot_root()?.as_std_path())?;
+    provision::run(&discovery, snapshot, transports, preflight)
 }
 
-fn execute(request: SetupRequest) -> Result<i32, Error> {
-    tracing::debug!(
-        ?request,
-        "setup request accepted; provisioning is not implemented"
-    );
-    // No success until provisioning exists, even for plan/check or --__test-run.
-    Err(Error::NotImplemented)
+fn validate_request(request: &SetupRequest) -> Result<(), Error> {
+    if request.mode != Mode::Provision
+        || request.lock != LockMode::Frozen
+        || !request.tools_only
+        || request.force
+        || request.offline
+        || request.update_lock
+    {
+        return Err(Error::NotImplemented);
+    }
+    Ok(())
 }
+
+#[cfg(all(
+    test,
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))
+))]
+#[path = "setup/tests.rs"]
+mod provisioning_tests;
 
 #[cfg(test)]
 mod tests {
@@ -140,6 +193,13 @@ mod tests {
             panic!("expected setup");
         };
         SetupRequest::new(&setup_args, ci)
+    }
+
+    #[test]
+    fn platform_qualification_rejects_unsupported_hosts_including_musl() {
+        let arch = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
+        let host = cfg!(target_os = "macos") || cfg!(all(target_os = "linux", target_env = "gnu"));
+        assert_eq!(provision::platform().is_ok(), arch && host);
     }
 
     #[test]
@@ -179,7 +239,10 @@ mod tests {
         ] {
             let request = request(&flags, false).unwrap();
             assert_eq!(request.mode, mode);
-            assert!(matches!(execute(request), Err(Error::NotImplemented)));
+            assert!(matches!(
+                validate_request(&request),
+                Err(Error::NotImplemented)
+            ));
         }
         let request =
             request(&["--force", "--offline", "--tools-only", "--no-lock"], true).unwrap();
